@@ -15,6 +15,7 @@ DerivedData/
 .netrc
 *.class
 bin/
+!SwiftJavaMacros.artifactbundle/**/bin/
 BuildLogic/out/
 .index-build
 .build-vscode
