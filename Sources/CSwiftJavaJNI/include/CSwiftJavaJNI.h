@@ -18,7 +18,7 @@
 #ifdef __ANDROID__
 #include <jni.h>
 #else
-#include "jni.h"
+#include "jdk-jni/jni.h"
 #endif
 
 #endif /* CSwiftJavaJNI_h */

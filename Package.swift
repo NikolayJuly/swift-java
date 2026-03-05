@@ -1,5 +1,6 @@
 // swift-tools-version: 6.2
 
+import CompilerPluginSupport
 import Foundation
 import PackageDescription
 
@@ -45,17 +46,6 @@ func findJavaHome() -> String {
 
 let javaHome = findJavaHome()
 
-// Path to pre-built macro plugin binary
-let macroPluginPath = URL(fileURLWithPath: #filePath)
-  .deletingLastPathComponent()
-  .appendingPathComponent("SwiftJavaMacros.artifactbundle/SwiftJavaMacros-tool/bin/SwiftJavaMacros-tool")
-  .path
-
-let loadMacroPlugin: SwiftSetting = .unsafeFlags([
-  "-load-plugin-executable",
-  "\(macroPluginPath)#SwiftJavaMacros",
-])
-
 let package = Package(
   name: "swift-java",
   platforms: [
@@ -85,6 +75,9 @@ let package = Package(
     ),
   ],
   traits: [],
+  dependencies: [
+    .package(url: "https://github.com/swiftlang/swift-syntax", from: "602.0.0"),
+  ],
   targets: [
     .target(
       name: "CSwiftJavaJNI",
@@ -118,10 +111,22 @@ let package = Package(
       ]
     ),
 
+    .macro(
+      name: "SwiftJavaMacros",
+      dependencies: [
+        .product(name: "SwiftSyntaxMacros", package: "swift-syntax"),
+        .product(name: "SwiftCompilerPlugin", package: "swift-syntax"),
+      ],
+      swiftSettings: [
+        .swiftLanguageMode(.v5)
+      ]
+    ),
+
     .target(
       name: "SwiftJava",
       dependencies: [
         "SwiftJavaJNICore",
+        "SwiftJavaMacros",
       ],
       exclude: ["swift-java.config"],
       swiftSettings: [
@@ -131,7 +136,6 @@ let package = Package(
           ["-Xfrontend", "-sil-verify-none"],
           .when(configuration: .release)
         ),
-        loadMacroPlugin,
       ],
       linkerSettings: [
         .unsafeFlags(
@@ -157,7 +161,6 @@ let package = Package(
       exclude: ["swift-java.config"],
       swiftSettings: [
         .swiftLanguageMode(.v5),
-        loadMacroPlugin,
       ]
     ),
     .target(
@@ -167,7 +170,6 @@ let package = Package(
       exclude: ["swift-java.config"],
       swiftSettings: [
         .swiftLanguageMode(.v5),
-        loadMacroPlugin,
       ]
     ),
     .target(
@@ -177,7 +179,6 @@ let package = Package(
       exclude: ["swift-java.config"],
       swiftSettings: [
         .swiftLanguageMode(.v5),
-        loadMacroPlugin,
       ]
     ),
   ]
