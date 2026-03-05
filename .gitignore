@@ -51,3 +51,4 @@ Package.resolved
 
 
 BuildLogic/.kotlin/
+.claude/settings.local.json
