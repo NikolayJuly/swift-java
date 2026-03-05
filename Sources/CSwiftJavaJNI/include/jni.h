@@ -1912,7 +1912,7 @@ typedef struct JavaVMInitArgs {
 typedef struct JavaVMAttachArgs {
     jint version;
 
-    char *name;
+    const char *name;
     jobject group;
 } JavaVMAttachArgs;
 
