@@ -15,6 +15,10 @@
 #ifndef CSwiftJavaJNI_h
 #define CSwiftJavaJNI_h
 
+#ifdef __ANDROID__
 #include <jni.h>
+#else
+#include "jni.h"
+#endif
 
 #endif /* CSwiftJavaJNI_h */
