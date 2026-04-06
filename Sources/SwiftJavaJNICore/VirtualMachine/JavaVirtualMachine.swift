@@ -18,6 +18,19 @@ import FoundationEssentials
 import Foundation
 #endif
 
+#if canImport(Android)
+import Android
+#elseif os(Windows)
+import ucrt
+import WinSDK
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(Darwin)
+import Darwin
+#endif
+
 public typealias JavaVMPointer = UnsafeMutablePointer<JavaVM?>
 #if canImport(Android)
 typealias JNIEnvPointer = UnsafeMutablePointer<JNIEnv?>
@@ -71,7 +84,7 @@ public final class JavaVirtualMachine: @unchecked Sendable {
     classpath: [String] = [],
     vmOptions: [String] = [],
     ignoreUnrecognized: Bool = false
-  ) throws {
+  ) throws(VMError) {
     self.classpath = classpath
     var jvm: JavaVMPointer? = nil
     var environment: JNIEnvPointer? = nil
@@ -118,8 +131,13 @@ public final class JavaVirtualMachine: @unchecked Sendable {
     vmArgs.options = optionsBuffer.baseAddress
     vmArgs.nOptions = jint(optionsBuffer.count)
 
+    typealias CreateJavaVM = @convention(c) (_ pvm: UnsafeMutablePointer<JavaVMPointer?>?, _ penv: UnsafeMutablePointer<JNIEnvPointer?>?, _ args: UnsafeMutableRawPointer) -> jint
+    guard let createJavaVM: CreateJavaVM = symbol(try loadLibJava(), "JNI_CreateJavaVM") else {
+      throw VMError(.cannotLoadCreateJavaVM)
+    }
+
     // Create the JVM instance.
-    if let createError = VMError(fromJNIError: JNI_CreateJavaVM(&jvm, &environment, &vmArgs)) {
+    if let createError = VMError(fromJNIError: createJavaVM(&jvm, &environment, &vmArgs)) {
       throw createError
     }
 
@@ -127,7 +145,7 @@ public final class JavaVirtualMachine: @unchecked Sendable {
     self.destroyOnDeinit = .init(initialState: true)
   }
 
-  public func destroyJVM() throws {
+  public func destroyJVM() throws(VMError) {
     try self.detachCurrentThread()
     if let error = VMError(fromJNIError: jvm.pointee!.pointee.DestroyJavaVM(jvm)) {
       throw error
@@ -163,7 +181,7 @@ extension JavaVirtualMachine {
   /// - Parameter
   ///   - asDaemon: Whether this thread should be treated as a daemon
   ///     thread in the Java Virtual Machine.
-  public func environment(asDaemon: Bool = false) throws -> JNIEnvironment {
+  public func environment(asDaemon: Bool = false) throws(VMError) -> JNIEnvironment {
     // Check whether this thread is already attached. If so, return the
     // corresponding environment.
     var environment: UnsafeMutableRawPointer? = nil
@@ -207,7 +225,7 @@ extension JavaVirtualMachine {
 
   /// Detach the current thread from the Java Virtual Machine. All Java
   /// threads waiting for this thread to die are notified.
-  func detachCurrentThread() throws {
+  func detachCurrentThread() throws(VMError) {
     if let resultError = VMError(fromJNIError: jvm.pointee!.pointee.DetachCurrentThread(jvm)) {
       throw resultError
     }
@@ -254,13 +272,13 @@ extension JavaVirtualMachine {
     vmOptions: [String] = [],
     ignoreUnrecognized: Bool = false,
     replace: Bool = false
-  ) throws -> JavaVirtualMachine {
+  ) throws(VMError) -> JavaVirtualMachine {
     precondition(
       !classpath.contains(where: { $0.contains(FileManager.pathSeparator) }),
       "Classpath element must not contain `\(FileManager.pathSeparator)`! Split the path into elements! Was: \(classpath)"
     )
 
-    return try sharedJVM.withLock { (sharedJVMPointer: inout JavaVirtualMachine?) in
+    return try sharedJVM.withLock { (sharedJVMPointer: inout JavaVirtualMachine?) throws(VMError) in
       // If we already have a JavaVirtualMachine instance, return it.
       if replace {
         print("[swift-java] Replace JVM instance!")
@@ -273,14 +291,19 @@ extension JavaVirtualMachine {
         }
       }
 
+      typealias GetCreatedJavaVMs = @convention(c) (_ pvm: UnsafeMutablePointer<JavaVMPointer?>, _ count: Int32, _ num: UnsafeMutablePointer<Int32>) -> jint
+      guard let getCreatedJavaVMs: GetCreatedJavaVMs = symbol(try loadLibJava(), "JNI_GetCreatedJavaVMs") else {
+        throw VMError(.cannotLoadGetCreatedJavaVMs)
+      }
+
       while true {
         var wasExistingVM: Bool = false
         while true {
           // Query the JVM itself to determine whether there is a JVM
           // instance that we don't yet know about.
-          var jvm: UnsafeMutablePointer<JavaVM?>? = nil
+          var jvm: JavaVMPointer? = nil
           var numJVMs: jsize = 0
-          if JNI_GetCreatedJavaVMs(&jvm, 1, &numJVMs) == JNI_OK, numJVMs >= 1 {
+          if getCreatedJavaVMs(&jvm, 1, &numJVMs) == JNI_OK, numJVMs >= 1 {
             // Adopt this JVM into a new instance of the JavaVirtualMachine
             // wrapper.
             let javaVirtualMachine = JavaVirtualMachine(adoptingJVM: jvm!)
@@ -301,12 +324,16 @@ extension JavaVirtualMachine {
               vmOptions: vmOptions,
               ignoreUnrecognized: ignoreUnrecognized
             )
-          } catch VMError.existingVM {
+          } catch .existingVM {
             // We raced with code outside of this JavaVirtualMachine instance
             // that created a VM while we were trying to do the same. Go
             // through the loop again to pick up the underlying JVM pointer.
             wasExistingVM = true
             continue
+          } catch let error as VMError {
+            throw error
+          } catch {
+            fatalError("Unexpected non-VMError from JavaVirtualMachine.init: \(error)")
           }
 
           sharedJVMPointer = javaVirtualMachine
@@ -335,40 +362,201 @@ extension JavaVirtualMachine {
 }
 
 extension JavaVirtualMachine {
-  /// Describes the kinds of errors that can occur when interacting with JNI.
-  enum VMError: Error {
-    /// There is already a Java Virtual Machine.
-    case existingVM
+  /// Describes an error that occurred when interacting with JNI.
+  public struct VMError: Error {
+    /// The specific kind of error that occurred.
+    public let code: Code
 
-    /// JNI version mismatch error.
-    case jniVersion
+    /// The source file where the error was created.
+    public let file: String
 
-    /// Thread is detached from the VM.
-    case threadDetached
+    /// The source line where the error was created.
+    public let line: UInt
 
-    /// Out of memory.
-    case outOfMemory
-
-    /// Invalid arguments.
-    case invalidArguments
-
-    /// Unknown JNI error.
-    case unknown(jint, file: String, line: UInt)
+    public init(_ code: Code, file: String = #fileID, line: UInt = #line) {
+      self.code = code
+      self.file = file
+      self.line = line
+    }
 
     init?(fromJNIError error: jint, file: String = #fileID, line: UInt = #line) {
-      switch error {
-      case JNI_OK: return nil
-      case JNI_EDETACHED: self = .threadDetached
-      case JNI_EVERSION: self = .jniVersion
-      case JNI_ENOMEM: self = .outOfMemory
-      case JNI_EEXIST: self = .existingVM
-      case JNI_EINVAL: self = .invalidArguments
-      default: self = .unknown(error, file: file, line: line)
+      guard error != JNI_OK else { return nil }
+      self.code = Code(rawValue: error)
+      self.file = file
+      self.line = line
+    }
+
+    /// The kinds of errors that can occur when interacting with JNI.
+    public struct Code: RawRepresentable, Equatable, Hashable, Sendable {
+      public let rawValue: Int32
+
+      public init(rawValue: Int32) {
+        self.rawValue = rawValue
       }
+
+      /// Thread is detached from the VM.                       (JNI_EDETACHED)
+      public static var threadDetached: Code { Code(rawValue: JNI_EDETACHED) }
+
+      /// JNI version mismatch error.                          (JNI_EVERSION)
+      public static var jniVersion: Code { Code(rawValue: JNI_EVERSION) }
+
+      /// Out of memory.                                        (JNI_ENOMEM)
+      public static var outOfMemory: Code { Code(rawValue: JNI_ENOMEM) }
+
+      /// There is already a Java Virtual Machine.             (JNI_EEXIST)
+      public static var existingVM: Code { Code(rawValue: JNI_EEXIST) }
+
+      /// Invalid arguments.                                    (JNI_EINVAL)
+      public static var invalidArguments: Code { Code(rawValue: JNI_EINVAL) }
+
+      /// Cannot locate a `JAVA_HOME`.
+      public static var javaHomeNotFound: Code { Code(rawValue: -100) }
+
+      /// Cannot find `libjvm`.
+      public static var libjvmNotFound: Code { Code(rawValue: -101) }
+
+      /// Cannot `dlopen` `libjvm`.
+      public static var libjvmNotLoaded: Code { Code(rawValue: -102) }
+
+      /// Cannot load `JNI_GetCreatedJavaVMs` from `libjvm`.
+      public static var cannotLoadGetCreatedJavaVMs: Code { Code(rawValue: -103) }
+
+      /// Cannot load `JNI_CreateJavaVM` from `libjvm`.
+      public static var cannotLoadCreateJavaVM: Code { Code(rawValue: -104) }
     }
   }
+}
 
-  enum JavaKitError: Error {
-    case classpathEntryNotFound(entry: String, classpath: [String])
+/// Pattern matching operator to enable switching on ``JavaVirtualMachine.VMError`` codes.
+public func ~= (code: JavaVirtualMachine.VMError.Code, error: any Error) -> Bool {
+  guard let error = error as? JavaVirtualMachine.VMError else {
+    return false
   }
+  return error.code == code
+}
+
+// ==== ------------------------------------------------------------------------
+// MARK: Utilities for loading libjvm and JNI entry point symbols.
+
+#if os(Windows)
+private typealias DylibType = HMODULE
+
+private func symbol<T>(_ handle: DylibType, _ name: String) -> T? {
+  guard let result = GetProcAddress(handle, name) else {
+    return nil
+  }
+  return unsafeBitCast(result, to: T.self)
+}
+#else
+private typealias DylibType = UnsafeMutableRawPointer
+
+private func symbol<T>(_ handle: DylibType, _ name: String) -> T? {
+  guard let result = dlsym(handle, name) else {
+    return nil
+  }
+  return unsafeBitCast(result, to: T.self)
+}
+#endif
+
+/// The Java installation folder for the system, found either with `JAVA_HOME` environment or by checking standard locations
+func systemJavaHome() -> String? {
+  // always defer to JAVA_HOME when it is set in the environment
+  if let javaHome = ProcessInfo.processInfo.environment["JAVA_HOME"] {
+    return javaHome
+  }
+
+  // if JAVA_HOME is unset, hunt around some standard locations
+  var defaultJavaPaths: [String] = []
+
+  #if os(macOS)
+  #if arch(x86_64)
+  defaultJavaPaths += ["/usr/local/opt/java"] // macOS Homebrew x86
+  #else
+  defaultJavaPaths += ["/opt/homebrew/opt/java"] // macOS Homebrew
+  #endif
+  defaultJavaPaths += ["/System/Library/Frameworks/JavaVM.framework/Home"] // macOS legacy path
+  #endif
+
+  #if os(Linux)
+  defaultJavaPaths += [
+    "/usr/lib/jvm/default-java", // Ubuntu/Debian
+    "/usr/lib/jvm/default", // Arch
+    "/usr/lib/jvm/java", // rhel-ubi9, amazonlinux2
+  ]
+  #endif
+
+  if let javaHome = defaultJavaPaths.first(where: {
+    FileManager.default.fileExists(atPath: $0)
+  }) {
+    return javaHome
+  }
+
+  return nil
+}
+
+/// Located the shared library that includes the `JNI_GetCreatedJavaVMs` and `JNI_CreateJavaVM` entry points to the `JNINativeInterface` function table
+private func loadLibJava() throws(JavaVirtualMachine.VMError) -> DylibType {
+  #if os(Android)
+  // Try standard library names and APEX paths for API 29+
+  for libname in [
+    "libart.so",
+    "/apex/com.android.runtime/lib64/libart.so",
+    "/apex/com.android.art/lib64/libart.so",
+    "libdvm.so",
+    "libnativehelper.so",
+  ] {
+    if let lib = dlopen(libname, RTLD_NOW) {
+      return lib
+    }
+  }
+  #endif
+
+  guard let javaHome = systemJavaHome() else {
+    throw JavaVirtualMachine.VMError(.javaHomeNotFound)
+  }
+
+  let javaHomeURL = URL(fileURLWithPath: javaHome, isDirectory: true)
+
+  // look through some standard locations relative to JAVA_HOME
+  let libjvmPaths: [URL]
+
+  #if os(Windows)
+  libjvmPaths = [
+    URL(fileURLWithPath: "bin\\server\\jvm.dll", relativeTo: javaHomeURL),
+    URL(fileURLWithPath: "bin\\jvm.dll", relativeTo: javaHomeURL),
+    URL(fileURLWithPath: "bin\\client\\jvm.dll", relativeTo: javaHomeURL), // older JDKs
+  ]
+  #else
+  #if canImport(Darwin)
+  let ext = "dylib" // macOS, etc.
+  #else
+  let ext = "so" // Linux, Android, etc.
+  #endif
+  libjvmPaths = [
+    URL(fileURLWithPath: "jre/lib/server/libjvm.\(ext)", relativeTo: javaHomeURL),
+    URL(fileURLWithPath: "lib/server/libjvm.\(ext)", relativeTo: javaHomeURL),
+    URL(fileURLWithPath: "lib/libjvm.\(ext)", relativeTo: javaHomeURL),
+    URL(fileURLWithPath: "libexec/openjdk.jdk/Contents/Home/lib/server/libjvm.\(ext)", relativeTo: javaHomeURL),
+  ]
+  #endif
+
+  guard
+    let libjvmPath = libjvmPaths.first(where: {
+      FileManager.default.isReadableFile(atPath: $0.path)
+    })
+  else {
+    throw JavaVirtualMachine.VMError(.libjvmNotFound)
+  }
+
+  #if os(Windows)
+  let dylib = LoadLibraryA(libjvmPath.path)
+  #else
+  let dylib = dlopen(libjvmPath.path, RTLD_NOW)
+  #endif
+
+  guard let dylib else {
+    throw JavaVirtualMachine.VMError(.libjvmNotLoaded)
+  }
+
+  return dylib
 }

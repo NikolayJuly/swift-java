@@ -73,6 +73,10 @@ let package = Package(
       name: "JavaIO",
       targets: ["JavaIO"]
     ),
+    .library(
+      name: "CSwiftJavaSignalStubs",
+      targets: ["CSwiftJavaSignalStubs"]
+    ),
   ],
   traits: [],
   dependencies: [
@@ -85,6 +89,10 @@ let package = Package(
         .linkedLibrary("log", .when(platforms: [.android]))
       ]
     ),
+
+    // No-op signal handler stubs for ART's libsigchain.
+    // Must be linked into the main executable (not a .so) — see header for details.
+    .target(name: "CSwiftJavaSignalStubs"),
 
     .target(
       name: "SwiftJavaJNICore",
@@ -179,6 +187,28 @@ let package = Package(
       exclude: ["swift-java.config"],
       swiftSettings: [
         .swiftLanguageMode(.v5),
+      ]
+    ),
+
+    .executableTarget(
+      name: "AndroidJVMTest",
+      dependencies: [
+        "CSwiftJavaSignalStubs",
+        "SwiftJava",
+        "SwiftJavaJNICore",
+      ],
+      path: "Tests/AndroidJVMTest",
+      swiftSettings: [
+        .swiftLanguageMode(.v5),
+      ],
+      linkerSettings: [
+        // Pull signal stubs from CSwiftJavaSignalStubs.a into the executable
+        // and export them so dlsym(RTLD_DEFAULT, ...) can find them.
+        .unsafeFlags([
+          "-Xlinker", "-u", "-Xlinker", "SetSpecialSignalHandlerFn",
+          "-Xlinker", "-u", "-Xlinker", "AddSpecialSignalHandlerFn",
+          "-Xlinker", "--export-dynamic",
+        ], .when(platforms: [.android])),
       ]
     ),
   ]
